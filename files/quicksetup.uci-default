@@ -1,0 +1,7 @@
+#!/bin/sh
+# UCI defaults for quicksetup
+
+# 包安装/升级后自动启用服务
+/etc/init.d/quicksetup enable 2>/dev/null
+
+exit 0
