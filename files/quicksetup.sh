@@ -486,17 +486,372 @@ disk_menu() {
 # ──────────────────────────────────────────────────────────────────────────────
 # 主菜单
 # ──────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# 功能 6: 一键安装 OpenWrt 到物理磁盘 (x86)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# 获取 rootfs 所在的物理母盘路径 (例如 /dev/loop0p1 -> 排除所有 loop0 相关, /dev/sdb1 -> /dev/sdb)
+get_root_physical_disk() {
+    local root_dev
+    root_dev=$(awk '$2 == "/" {print $1}' /proc/mounts 2>/dev/null)
+
+    [ -z "$root_dev" ] && echo "" && return
+
+    local base_dev
+
+    # loop 设备: /dev/loop0p1 或 /dev/loop0 -> 取 loop0
+    if echo "$root_dev" | grep -q '^/dev/loop'; then
+        base_dev=$(echo "$root_dev" | grep -oE '/dev/loop[0-9]+')
+        echo "$base_dev"
+        return
+    fi
+
+    # NVMe: /dev/nvme0n1p2 -> /dev/nvme0n1
+    if echo "$root_dev" | grep -q '^/dev/nvme'; then
+        base_dev=$(echo "$root_dev" | sed -E 's/^\/dev\/(nvme[0-9]+n[0-9]+).*/\/dev\/\1/')
+        echo "$base_dev"
+        return
+    fi
+
+    # SCSI/SATA/USB: /dev/sda1 -> /dev/sda
+    if echo "$root_dev" | grep -q '^/dev/sd'; then
+        base_dev=$(echo "$root_dev" | sed -E 's/^\/dev\/(sd[a-z]+).*/\/dev\/\1/')
+        echo "$base_dev"
+        return
+    fi
+
+    # MMC: /dev/mmcblk0p2 -> /dev/mmcblk0
+    if echo "$root_dev" | grep -q '^/dev/mmcblk'; then
+        base_dev=$(echo "$root_dev" | sed -E 's/^\/dev\/(mmcblk[0-9]+).*/\/dev\/\1/')
+        echo "$base_dev"
+        return
+    fi
+
+    # VIRTIO: /dev/vda1 -> /dev/vda
+    if echo "$root_dev" | grep -q '^/dev/vd'; then
+        base_dev=$(echo "$root_dev" | sed -E 's/^\/dev\/(vd[a-z]+).*/\/dev\/\1/')
+        echo "$base_dev"
+        return
+    fi
+
+    echo "$root_dev"
+}
+
+# 扫描安全的物理磁盘 (排除 rootfs 所在盘 + loop + ram + dm)
+scan_install_disks() {
+    local root_disk
+    root_disk=$(get_root_physical_disk)
+
+    # 同时获取 initrd/squashfs/overlay 所有挂载点关联的设备
+    local exclude_disks=""
+    while IFS= read -r dev; do
+        [ -z "$dev" ] && continue
+        local phys
+        phys=$(echo "$dev" | sed -E 's/p?[0-9]+$//')
+        # NVMe 特殊处理
+        phys=$(echo "$phys" | sed -E 's/(nvme[0-9]+n[0-9]+).*/\1/')
+        exclude_disks="${exclude_disks} ${phys}"
+    done < <(awk '{print $1}' /proc/mounts | sort -u)
+
+    for bdev in /sys/block/*; do
+        local name
+        name=$(basename "$bdev")
+
+        # 跳过非物理设备
+        case "$name" in
+            loop*|ram*|dm-*|zram*|nbd*|sr*) continue ;;
+        esac
+
+        # 必须是块设备
+        local dev="/dev/${name}"
+        [ ! -b "$dev" ] && continue
+
+        # 排除 rootfs 母盘
+        if [ -n "$root_disk" ] && [ "$dev" = "$root_disk" ]; then
+            continue
+        fi
+
+        # 排除所有挂载设备的母盘
+        local skip=0
+        for ed in $exclude_disks; do
+            if [ "$dev" = "$ed" ]; then
+                skip=1
+                break
+            fi
+        done
+        [ "$skip" -eq 1 ] && continue
+
+        # 获取容量 (人类可读)
+        local size_bytes
+        size_bytes=$(cat "$bdev/size" 2>/dev/null || echo 0)
+        local size_human
+        if [ "$size_bytes" -gt 0 ] 2>/dev/null; then
+            local size_gb=$(( size_bytes * 512 / 1000 / 1000 / 1000 ))
+            if [ "$size_gb" -ge 1000 ]; then
+                size_human="$(( size_bytes * 512 / 1000 / 1000 / 1000 / 1000 ))TB"
+            else
+                size_human="${size_gb}GB"
+            fi
+        else
+            size_human="?GB"
+        fi
+
+        # 获取型号
+        local model=""
+        if [ -f "$bdev/device/model" ]; then
+            model=$(cat "$bdev/device/model" 2>/dev/null | sed 's/^ *//;s/ *$//')
+        fi
+        [ -z "$model" ] && model="(未知型号)"
+
+        # 获取传输类型
+        local transport=""
+        if [ -f "$bdev/device/transport" ]; then
+            transport=$(cat "$bdev/device/transport" 2>/dev/null)
+        fi
+        local tag=""
+        [ -n "$transport" ] && tag=" [${transport}]"
+
+        echo "${dev}|${size_human}|${model}${tag}"
+    done
+}
+
+# 验证 .img.gz 文件头 (检查 gzip magic bytes)
+verify_gzip_file() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        echo "文件不存在: $file"
+        return 1
+    fi
+
+    # 检查 gzip magic number: 0x1f 0x8b
+    local magic
+    magic=$(dd if="$file" bs=2 count=1 2>/dev/null | xxd -p 2>/dev/null)
+    if [ "$magic" = "1f8b" ]; then
+        return 0
+    fi
+
+    # 兼容: 文件可能未压缩 (.img)
+    if echo "$file" | grep -qiE '\.img$'; then
+        # .img 文件直接允许
+        return 0
+    fi
+
+    echo "文件格式无效 (非 gzip 压缩的 .img.gz)"
+    return 1
+}
+
+menu_install_x86() {
+    local root_disk
+    root_disk=$(get_root_physical_disk)
+
+    # ── 信息页 ──
+    local info_msg="【安装 OpenWrt 到物理磁盘】\n\n"
+    info_msg="${info_msg}当前系统根设备: ${root_disk:-未知}\n"
+    info_msg="${info_msg}内核版本: $(uname -r)\n"
+    info_msg="${info_msg}架构: $(uname -m)\n\n"
+    info_msg="${info_msg}此功能将把 OpenWrt 固件(.img.gz)写入\n"
+    info_msg="${info_msg}目标物理磁盘，实现从磁盘直接启动。\n\n"
+    info_msg="${info_msg}⚠️  目标磁盘数据将被完全擦除！"
+
+    whiptail --title "$TITLE" --msgbox "$info_msg" 18 58
+
+    # ── 扫描安全磁盘 ──
+    local disk_list
+    disk_list=$(scan_install_disks)
+
+    if [ -z "$disk_list" ]; then
+        whiptail --title "$TITLE" \
+                 --msgbox "未检测到可用的目标磁盘。\n\n可能原因:\n- 系统仅一块盘 (已被 rootfs 占用)\n- 所有磁盘均已被挂载\n- 运行在非 x86 环境" 14 52
+        return 1
+    fi
+
+    # ── 构建菜单参数 ──
+    local menu_args=""
+    while IFS='|' read -r dev size model; do
+        menu_args="${menu_args} ${dev} \"${size}  ${model}\""
+    done <<< "$disk_list"
+
+    # ── 选择目标磁盘 ──
+    local target_disk
+    target_disk=$(eval whiptail --title \"$TITLE\" \
+                                --menu \"选择目标安装磁盘:\" \
+                                20 68 8 \
+                                $menu_args \
+                                3>&1 1>&2 2>&3)
+
+    if [ $? -ne 0 ] || [ -z "$target_disk" ]; then
+        return 1
+    fi
+
+    # ── 获取选中磁盘信息 ──
+    local disk_info_line
+    disk_info_line=$(echo "$disk_list" | grep "^${target_disk}|")
+    local disk_size disk_model
+    disk_size=$(echo "$disk_info_line" | cut -d'|' -f2)
+    disk_model=$(echo "$disk_info_line" | cut -d'|' -f3)
+
+    # 获取分区列表
+    local partitions
+    partitions=$(lsblk -ln -o NAME,SIZE,FSTYPE "$target_disk" 2>/dev/null | \
+                 grep -v "^$(basename "$target_disk") " | \
+                 awk '{printf "  /dev/%-12s %-8s %s\n", $1, $2, ($3!="" ? $3 : "(无文件系统)")}')
+    [ -z "$partitions" ] && partitions="  (无分区)"
+
+    # ── 第一次危险确认 ──
+    if ! whiptail --title "$TITLE" \
+                  --defaultno \
+                  --yesno "⚠️  危险操作 — 第一次警告  ⚠️\n\n目标磁盘:  ${target_disk}\n磁盘容量:  ${disk_size}\n磁盘型号:  ${disk_model}\n\n当前分区:\n${partitions}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n此操作将【彻底擦除】该磁盘上的\n所有分区表、数据和引导记录！\n\n是否继续？" \
+                  22 68; then
+        return 1
+    fi
+
+    # ── 第二次危险确认 (强化) ──
+    if ! whiptail --title "$TITLE" \
+                  --defaultno \
+                  --yesno "🚨  最终确认 — 不可逆操作  🚨\n\n你即将把 OpenWrt 固件写入:\n\n  >>> ${target_disk} (${disk_size}) <<<\n\n写入过程无法中断，数据无法恢复！\n\n如你 100% 确认，请选择 [是]\n否则请立即选择 [否] 退出。" \
+                  18 58; then
+        return 1
+    fi
+
+    # ── 指定固件路径 ──
+    local default_path="/tmp/openwrt.img.gz"
+    # 检测当前目录是否有 .img.gz
+    local local_img
+    local_img=$(ls -1 ./*.img.gz 2>/dev/null | head -1)
+    [ -n "$local_img" ] && default_path="$local_img"
+
+    local img_path
+    img_path=$(whiptail --title "$TITLE" \
+                        --inputbox "请输入固件文件路径:\n(.img.gz 格式，支持流式解压写入)" \
+                        12 58 "$default_path" \
+                        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return 1
+
+    # ── 校验文件 ──
+    if [ ! -f "$img_path" ]; then
+        whiptail --title "$TITLE" --msgbox "错误: 文件不存在\n\n${img_path}" 10 50
+        return 1
+    fi
+
+    # 检查是否 .img.gz 或 .img
+    local is_gzip=0
+    if echo "$img_path" | grep -qiE '\.img\.gz$'; then
+        is_gzip=1
+        # 验证 gzip 头
+        local magic
+        magic=$(dd if="$img_path" bs=2 count=1 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' ')
+        if [ "$magic" != "1f8b" ]; then
+            whiptail --title "$TITLE" --msgbox "错误: 文件不是有效的 gzip 格式\n\n${img_path}" 10 50
+            return 1
+        fi
+    elif echo "$img_path" | grep -qiE '\.img$'; then
+        is_gzip=0
+    else
+        # 未知扩展名，尝试检测
+        local magic
+        magic=$(dd if="$img_path" bs=2 count=1 2>/dev/null | od -A n -t x1 2>/dev/null | tr -d ' ')
+        if [ "$magic" = "1f8b" ]; then
+            is_gzip=1
+        fi
+    fi
+
+    # ── 文件大小信息 ──
+    local file_size
+    file_size=$(du -sh "$img_path" 2>/dev/null | awk '{print $1}')
+
+    # ── 执行前最终确认 ──
+    local write_cmd=""
+    if [ "$is_gzip" -eq 1 ]; then
+        write_cmd="zcat \"${img_path}\" | dd of=${target_disk} bs=4M conv=fsync status=progress"
+    else
+        write_cmd="dd if=\"${img_path}\" of=${target_disk} bs=4M conv=fsync status=progress"
+    fi
+
+    if ! whiptail --title "$TITLE" \
+                  --defaultno \
+                  --yesno "写入确认\n\n固件文件: ${img_path} (${file_size})\n目标磁盘: ${target_disk} (${disk_size})\n\n执行命令:\n${write_cmd}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n按 [是] 开始写入，此过程不可中断。" \
+                  20 68; then
+        return 1
+    fi
+
+    # ── 执行写入 ──
+    whiptail --title "$TITLE" \
+             --msgbox "即将开始写入...\n\n写入期间请勿断电或拔出磁盘。\n完成后将提示你重启系统。" 12 50
+
+    # 卸载目标磁盘的所有挂载点
+    local mps
+    mps=$(lsblk -ln -o MOUNTPOINT "$target_disk" 2>/dev/null | grep -v '^$')
+    for mp in $mps; do
+        umount -f "$mp" 2>/dev/null
+    done
+    sleep 1
+
+    # 写入 (后台执行，前台展示)
+    local write_log="/tmp/quicksetup_dd.log"
+    local write_pid
+
+    if [ "$is_gzip" -eq 1 ]; then
+        ( zcat "$img_path" | dd of="$target_disk" bs=4M conv=fsync 2>"$write_log" ) &
+    else
+        ( dd if="$img_path" of="$target_disk" bs=4M conv=fsync 2>"$write_log" ) &
+    fi
+    write_pid=$!
+
+    # 进度监控
+    local dot_count=0
+    while kill -0 "$write_pid" 2>/dev/null; do
+        sleep 2
+        dot_count=$((dot_count + 1))
+        # 获取 dd 进度 (从 stderr log 中)
+        local progress=""
+        if [ -f "$write_log" ]; then
+            progress=$(tail -1 "$write_log" 2>/dev/null | grep -oE '[0-9]+ [GMk]B')
+        fi
+        local dots=""
+        for i in $(seq 1 $((dot_count % 8))); do dots="${dots}."; done
+        echo "XXX"
+        echo "$((dot_count * 15))"
+        echo "正在写入 ${target_disk}...${dots}\n\n${progress:-请稍候}"
+        echo "XXX"
+    done | whiptail --title "$TITLE" --gauge "正在写入固件到 ${target_disk}" 10 60 0
+
+    # 检查写入结果
+    wait "$write_pid"
+    local write_ret=$?
+
+    if [ $write_ret -eq 0 ]; then
+        sync
+        # 获取写入统计
+        local dd_stats
+        dd_stats=$(cat "$write_log" 2>/dev/null | tail -3)
+
+        whiptail --title "$TITLE" \
+                 --msgbox "✅ 写入完成！\n\n目标磁盘: ${target_disk}\n写入统计:\n${dd_stats}\n\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n下一步操作:\n1. 拔掉 U 盘\n2. 进入 BIOS 设置磁盘启动\n3. 重启系统\n\n  reboot" \
+                 20 68
+    else
+        local dd_err
+        dd_err=$(cat "$write_log" 2>/dev/null)
+
+        whiptail --title "$TITLE" \
+                 --msgbox "❌ 写入失败！\n\n返回码: ${write_ret}\n错误信息:\n${dd_err}" \
+                 16 60
+    fi
+
+    rm -f "$write_log"
+    return $write_ret
+}
 main_menu() {
     while true; do
         local choice
         choice=$(whiptail --title "$TITLE" \
                           --menu "请选择要执行的操作:" \
-                          18 58 6 \
+                          20 58 7 \
                           "1" "查看网卡信息" \
                           "2" "修改 LAN IP" \
                           "3" "磁盘快捷操作" \
                           "4" "系统状态概览" \
-                          "5" "重启系统" \
+                          "5" "安装到磁盘 (x86)" \
+                          "6" "重启系统" \
                           "0" "退出向导" \
                           3>&1 1>&2 2>&3)
 
@@ -510,7 +865,8 @@ main_menu() {
             2) change_lan_ip   ;;
             3) disk_menu       ;;
             4) system_overview ;;
-            5) reboot_system   ;;
+            5) menu_install_x86 ;;
+            6) reboot_system   ;;
             0)
                 whiptail --title "$TITLE" --msgbox "已退出快捷部署向导。\n\n如需再次运行，请执行:\n  quicksetup" 9 48
                 break

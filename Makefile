@@ -24,7 +24,7 @@ define Package/quicksetup
   SECTION:=utils
   CATEGORY:=Utilities
   TITLE:=Quick Setup Wizard (TUI)
-  DEPENDS:=+libnewt +ip-full
+  DEPENDS:=+libnewt +ip-full +bash +coreutils-od
   URL:=
 endef
 
