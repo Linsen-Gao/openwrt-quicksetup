@@ -41,9 +41,6 @@ define Package/quicksetup/install
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/quicksetup.uci-default $(1)/etc/uci-defaults/90-quicksetup
-
-	$(INSTALL_DIR) $(1)/etc
-	$(INSTALL_DATA) ./files/etc/shadow $(1)/etc/shadow
 endef
 
 $(eval $(call BuildPackage,quicksetup))
