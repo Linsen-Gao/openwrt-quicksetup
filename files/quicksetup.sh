@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # ============================================================================
 # quicksetup - OpenWrt 25.12.4 纯净版快捷部署向导
 # 依赖: whiptail (libnewt), ip-full, uci, coreutils-stdbuf (可选)
