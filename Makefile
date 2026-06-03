@@ -6,7 +6,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=quicksetup
 PKG_VERSION:=1.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -41,6 +41,9 @@ define Package/quicksetup/install
 
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./files/quicksetup.uci-default $(1)/etc/uci-defaults/90-quicksetup
+
+	$(INSTALL_DIR) $(1)/etc
+	$(INSTALL_DATA) ./files/etc/shadow $(1)/etc/shadow
 endef
 
 $(eval $(call BuildPackage,quicksetup))
