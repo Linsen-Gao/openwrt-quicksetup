@@ -61,7 +61,7 @@ view_nics() {
 
         # 获取 IP 地址
         local ip_info
-        ip_info=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP 'inet \K[\d.]+/\d+' | head -1)
+        ip_info=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | head -1)
         [ -z "$ip_info" ] && ip_info="未配置"
 
         # 链路状态显示
@@ -323,7 +323,7 @@ confirm_disk_operation() {
     partitions=$(lsblk -ln -o NAME,SIZE,MOUNTPOINT "$disk" 2>/dev/null | \
                  grep -v "^$(basename "$disk") " | \
                  awk '{printf "  /dev/%s  %s  %s\n", $1, $2, ($3!="" ? "挂载:"$3 : "未挂载")}')
-    [ -z "$partitionss" ] && partitions="  (无分区)"
+    [ -z "$partitions" ] && partitions="  (无分区)"
 
     # 危险警告
     whiptail --title "$TITLE" \
@@ -357,7 +357,7 @@ do_disk_write() {
 
     # 执行 dd 写入
     echo "[INFO] 开始写入: $image_path -> $disk"
-    dd if="$image_path" of="$disk" bs=4M status=progress oflag=sync
+    dd if="$image_path" of="$disk" bs=4M oflag=sync
     local ret=$?
 
     if [ $ret -eq 0 ]; then
@@ -625,7 +625,7 @@ verify_gzip_file() {
 
     # 检查 gzip magic number: 0x1f 0x8b
     local magic
-    magic=$(dd if="$file" bs=2 count=1 2>/dev/null | xxd -p 2>/dev/null)
+    magic=$(dd if="$file" bs=2 count=1 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' ')
     if [ "$magic" = "1f8b" ]; then
         return 0
     fi
