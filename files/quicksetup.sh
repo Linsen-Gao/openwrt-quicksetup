@@ -154,7 +154,7 @@ change_lan_ip() {
 
     # IPv4 格式校验
     if ! validate_ipv4 "$new_ip"; then
-        whiptail --title "$TITLE" --msgbox "错误: \"${new_ip}\" 不是合法的 IPv4 地址！\n\n请输入格式如: 192.168.1.1" 10 50
+        whiptail --title "$TITLE" --msgbox "错误: \"${new_ip}\" 不是合法的 IPv4 地址！\n\n请输入格式如: 192.168.5.190" 10 50
         return 1
     fi
 
