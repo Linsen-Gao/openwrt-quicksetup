@@ -94,26 +94,41 @@ view_nics() {
 # 功能 2: 修改 LAN IP
 # ──────────────────────────────────────────────────────────────────────────────
 
-# IPv4 格式校验 (支持 CIDR /24 格式，不允许 /0-/32 以外)
+# IPv4 格式校验 (支持可选 CIDR，如 192.168.1.1 或 192.168.1.1/24)
 validate_ipv4() {
     local ip="$1"
+
+    # 分离 IP 和 CIDR 前缀
+    local ip_only="${ip%%/*}"
+    local cidr="${ip#$ip_only}"
 
     # 基础正则: x.x.x.x 每段 0-255
     local ip_part='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
     local pattern="^${ip_part}\.${ip_part}\.${ip_part}\.${ip_part}$"
 
-    if echo "$ip" | grep -qE "$pattern"; then
-        return 0
+    if ! echo "$ip_only" | grep -qE "$pattern"; then
+        return 1
     fi
 
-    return 1
+    # 如果有 CIDR 前缀则校验范围 0-32
+    if [ -n "$cidr" ]; then
+        cidr="${cidr#/}"
+        case "$cidr" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        [ "$cidr" -ge 0 ] 2>/dev/null && [ "$cidr" -le 32 ] 2>/dev/null && return 0
+        return 1
+    fi
+
+    return 0
 }
 
-# 检查是否为保留地址
+# 检查是否为不可用的保留/特殊地址 (RFC 6890 + CGNAT + benchmark + doc)
 is_reserved_ip() {
     local ip="$1"
-    case "$ip" in
-        0.*|127.*|169.254.*|224.*|240.*|255.255.255.255)
+    local ip_only="${ip%%/*}"
+    case "$ip_only" in
+        0.*|127.*|169.254.*|224.*|240.*|255.255.255.255|        100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*|        198.1[89].*|198.51.100.*|203.0.113.*)
             return 0 ;;
     esac
     return 1
@@ -268,8 +283,8 @@ select_disk() {
         return 1
     fi
 
-    # 构建 whiptail --menu 参数
-    local menu_items=""
+    # 构建 whiptail --menu 参数 (使用数组避免 eval 注入)
+    local menu_args=()
     local count=0
 
     while IFS= read -r line; do
@@ -279,7 +294,7 @@ select_disk() {
         model=$(echo "$line" | cut -d' ' -f3-)
         [ -z "$model" ] && model="(未知型号)"
 
-        menu_items="${menu_items} ${dev} \"${size}  ${model}\""
+        menu_args+=("$dev" "${size}  ${model}")
         count=$((count + 1))
     done <<< "$disks"
 
@@ -290,11 +305,11 @@ select_disk() {
 
     # 弹出选择菜单
     local selected_disk
-    selected_disk=$(eval whiptail --title \"$TITLE\" \
-                                  --menu \"请选择目标磁盘:\" \
-                                  18 68 8 \
-                                  $menu_items \
-                                  3>&1 1>&2 2>&3)
+    selected_disk=$(whiptail --title "$TITLE" \
+                              --menu "请选择目标磁盘:" \
+                              18 68 8 \
+                              "${menu_args[@]}" \
+                              3>&1 1>&2 2>&3)
 
     if [ $? -ne 0 ] || [ -z "$selected_disk" ]; then
         return 1
@@ -459,9 +474,20 @@ disk_menu() {
                             --yesno "最终确认:\n\n  写入: ${img_path}\n  到:   ${disk}\n\n此操作不可逆！\n按 [是] 开始写入。" \
                             14 58; then
 
-                    whiptail --title "$TITLE" \
-                             --msgbox "即将开始写入。\n\n请通过串口或 SSH 另开终端执行:\n\n  dd if=${img_path} of=${disk} bs=4M status=progress oflag=sync\n\n当前 TUI 仅为接口预留，实际写入建议在独立终端执行。" \
-                             16 68
+                    # 调用标准 dd 写入函数
+                    local write_ret
+                    do_disk_write "$disk" "$img_path"
+                    write_ret=$?
+
+                    if [ "$write_ret" -eq 0 ]; then
+                        whiptail --title "$TITLE" \
+                                 --msgbox "✅ 写入完成！\n\n目标磁盘: ${disk}\n镜像文件: ${img_path}" \
+                                 10 58
+                    else
+                        whiptail --title "$TITLE" \
+                                 --msgbox "❌ 写入失败！返回码: ${write_ret}" \
+                                 8 50
+                    fi
                 fi
                 ;;
             3)
@@ -665,19 +691,19 @@ menu_install_x86() {
         return 1
     fi
 
-    # ── 构建菜单参数 ──
-    local menu_args=""
+    # ── 构建菜单参数 (使用数组避免 eval 注入) ──
+    local menu_args=()
     while IFS='|' read -r dev size model; do
-        menu_args="${menu_args} ${dev} \"${size}  ${model}\""
+        menu_args+=("$dev" "${size}  ${model}")
     done <<< "$disk_list"
 
     # ── 选择目标磁盘 ──
     local target_disk
-    target_disk=$(eval whiptail --title \"$TITLE\" \
-                                --menu \"选择目标安装磁盘:\" \
-                                20 68 8 \
-                                $menu_args \
-                                3>&1 1>&2 2>&3)
+    target_disk=$(whiptail --title "$TITLE" \
+                            --menu "选择目标安装磁盘:" \
+                            20 68 8 \
+                            "${menu_args[@]}" \
+                            3>&1 1>&2 2>&3)
 
     if [ $? -ne 0 ] || [ -z "$target_disk" ]; then
         return 1
